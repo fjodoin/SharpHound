@@ -105,6 +105,16 @@ namespace Sharphound
         [Option(HelpText = "Disables Kerberos Signing/Sealing", Default = false)]
         public bool DisableSigning { get; set; }
 
+        // Proxy options
+        [Option(HelpText = "SOCKS5 proxy address (socks5://host:port or host:port)", Default = null)]
+        public string Proxy { get; set; }
+
+        [Option(HelpText = "Username for SOCKS5 proxy authentication", Default = null)]
+        public string ProxyUsername { get; set; }
+
+        [Option(HelpText = "Password for SOCKS5 proxy authentication", Default = null)]
+        public string ProxyPassword { get; set; }
+
         //Options that affect how enumeration is performed
         [Option(HelpText = "Skip checking if 445 is open", Default = false)]
         public bool SkipPortCheck { get; set; }

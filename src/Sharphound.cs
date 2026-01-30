@@ -23,6 +23,7 @@ using CommandLine;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
 using Sharphound.Client;
+using Sharphound.Proxy;
 using SharpHoundCommonLib;
 using SharpHoundCommonLib.Enums;
 
@@ -115,6 +116,56 @@ namespace Sharphound
                         ldapOptions.Password = options.LDAPPassword;
                     }
 
+                    // SOCKS5 Proxy validation
+                    Socks5ProxyConfig proxyConfig = null;
+                    if (options.Proxy != null)
+                    {
+                        try
+                        {
+                            proxyConfig = Socks5ProxyConfig.Parse(
+                                options.Proxy, options.ProxyUsername, options.ProxyPassword);
+                        }
+                        catch (ArgumentException ex)
+                        {
+                            logger.LogError("Invalid proxy configuration: {Message}", ex.Message);
+                            return;
+                        }
+
+                        if ((options.ProxyUsername != null) != (options.ProxyPassword != null))
+                        {
+                            logger.LogError(
+                                "You must specify both --proxyusername and --proxypassword for SOCKS5 proxy authentication");
+                            return;
+                        }
+
+                        if (options.DomainController == null)
+                        {
+                            logger.LogError(
+                                "You must specify --domaincontroller when using --proxy (DNS resolution may not work through the proxy)");
+                            return;
+                        }
+
+                        if (options.LDAPUsername == null || options.LDAPPassword == null)
+                        {
+                            logger.LogError(
+                                "You must specify --ldapusername and --ldappassword when using --proxy (Kerberos cannot authenticate to the local relay)");
+                            return;
+                        }
+
+                        if (flags.SearchForest || flags.RecurseDomains)
+                        {
+                            logger.LogWarning(
+                                "Cross-domain enumeration with SOCKS5 proxy may not work correctly. " +
+                                "The LDAP relay only tunnels to the DC specified by --domaincontroller. " +
+                                "Consider running SharpHound separately for each domain.");
+                        }
+
+                        logger.LogWarning(
+                            "SOCKS5 proxy enabled. RPC/SMB-based collection methods (Session, LocalGroup, " +
+                            "UserRights, Registry, etc.) will NOT be tunneled. Use --collectionmethods DCOnly " +
+                            "for full proxy coverage, or use an external tool (e.g., Proxifier) for RPC/SMB.");
+                    }
+
                     // Check to make sure both Local Admin Session Enum options are set if either is set
 
                     if (options.LocalAdminPassword != null && options.LocalAdminUsername == null ||
@@ -149,71 +200,127 @@ namespace Sharphound
                         }
                     }
 
-                    await StartCollection(options, logger, resolved, flags, ldapOptions);
+                    await StartCollection(options, logger, resolved, flags, ldapOptions, proxyConfig);
                 });
             } catch (Exception ex) {
                 logger.LogError($"Error running SharpHound: {ex.Message}\n{ex.StackTrace}");
             }
         }
 
-        private static async Task StartCollection(Options options, BasicLogger logger, CollectionMethod resolved, Flags flags, LdapConfig ldapOptions)
+        private static async Task StartCollection(Options options, BasicLogger logger, CollectionMethod resolved, Flags flags, LdapConfig ldapOptions, Socks5ProxyConfig proxyConfig)
         {
-            IContext context = new BaseContext(logger, ldapOptions, flags)
+            SocksTcpRelay ldapRelay = null;
+            SocksTcpRelay ldapsRelay = null;
+
+            try
             {
-                DomainName = options.Domain,
-                CacheFileName = options.CacheName,
-                ZipFilename = options.ZipFilename,
-                SearchBase = options.DistinguishedName,
-                StatusInterval = options.StatusInterval,
-                RealDNSName = options.RealDNSName,
-                ComputerFile = options.ComputerFile,
-                OutputPrefix = options.OutputPrefix,
-                OutputDirectory = options.OutputDirectory,
-                Jitter = options.Jitter,
-                Throttle = options.Throttle,
-                LdapFilter = options.LdapFilter,
-                PortScanTimeout = options.PortCheckTimeout,
-                ResolvedCollectionMethods = resolved,
-                Threads = options.Threads,
-                LoopDuration = options.LoopDuration,
-                LoopInterval = options.LoopInterval,
-                ZipPassword = options.ZipPassword,
-                IsFaulted = false,
-                LocalAdminUsername = options.LocalAdminUsername,
-                LocalAdminPassword = options.LocalAdminPassword
-            };
+                // Set up SOCKS5 relays if proxy is configured
+                if (proxyConfig != null)
+                {
+                    var targetDC = ldapOptions.Server;
 
-            var cancellationTokenSource = new CancellationTokenSource();
-            context.CancellationTokenSource = cancellationTokenSource;
+                    // Test SOCKS5 connectivity before proceeding
+                    var ldapPort = ldapOptions.Port > 0 ? ldapOptions.Port : 389;
+                    logger.LogInformation("Testing SOCKS5 proxy connectivity to {DC}:{Port}...", targetDC, ldapPort);
+                    try
+                    {
+                        using (var testClient = await Socks5Client.ConnectAsync(
+                            proxyConfig, targetDC, ldapPort, CancellationToken.None, 15000))
+                        {
+                            logger.LogInformation("SOCKS5 proxy connectivity test succeeded");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError("SOCKS5 proxy connectivity test failed: {Message}", ex.Message);
+                        logger.LogError("Cannot reach {DC}:{Port} through proxy {Proxy}:{ProxyPort}",
+                            targetDC, ldapPort, proxyConfig.ProxyHost, proxyConfig.ProxyPort);
+                        return;
+                    }
 
-            // Console.CancelKeyPress += delegate(object sender, ConsoleCancelEventArgs eventArgs)
-            // {
-            //     eventArgs.Cancel = true;
-            //     cancellationTokenSource.Cancel();
-            // };
+                    // Start LDAP relay
+                    ldapRelay = new SocksTcpRelay(proxyConfig, targetDC, ldapPort, logger, CancellationToken.None);
+                    ldapRelay.Start();
 
-            // Create new chain links
-            Links<IContext> links = new SharpLinks();
+                    // Start LDAPS relay
+                    var ldapsPort = ldapOptions.SSLPort > 0 ? ldapOptions.SSLPort : 636;
+                    ldapsRelay = new SocksTcpRelay(proxyConfig, targetDC, ldapsPort, logger, CancellationToken.None);
+                    ldapsRelay.Start();
 
-            // Run our chain
-            context = links.Initialize(context, ldapOptions);
-            if (context.Flags.IsFaulted)
-                return;
-            context = await links.TestConnection(context);
-            if (context.Flags.IsFaulted)
-                return;
-            context = links.SetSessionUserName(options.OverrideUserName, context);
-            context = links.InitCommonLib(context);
-            context = await links.GetDomainsForEnumeration(context);
-            if (context.Flags.IsFaulted)
-                return;
-            context = links.StartBaseCollectionTask(context);
-            context = await links.AwaitBaseRunCompletion(context);
-            context = links.StartLoopTimer(context);
-            context = links.StartLoop(context);
-            context = await links.AwaitLoopCompletion(context);
-            context = links.SaveCacheFile(context);
-            links.Finish(context);
+                    // Override LDAP config to point at local relays
+                    ldapOptions.Server = "127.0.0.1";
+                    ldapOptions.Port = ldapRelay.LocalPort;
+                    ldapOptions.SSLPort = ldapsRelay.LocalPort;
+
+                    // Kerberos cannot authenticate against 127.0.0.1, force Basic auth
+                    ldapOptions.AuthType = AuthType.Basic;
+                    ldapOptions.DisableSigning = true;
+
+                    if (!ldapOptions.ForceSSL)
+                    {
+                        logger.LogWarning(
+                            "Using Basic auth without LDAPS. Credentials are sent in cleartext to the relay. " +
+                            "Consider adding --forcesecureldap for encrypted LDAP.");
+                    }
+                }
+
+                IContext context = new BaseContext(logger, ldapOptions, flags)
+                {
+                    DomainName = options.Domain,
+                    CacheFileName = options.CacheName,
+                    ZipFilename = options.ZipFilename,
+                    SearchBase = options.DistinguishedName,
+                    StatusInterval = options.StatusInterval,
+                    RealDNSName = options.RealDNSName,
+                    ComputerFile = options.ComputerFile,
+                    OutputPrefix = options.OutputPrefix,
+                    OutputDirectory = options.OutputDirectory,
+                    Jitter = options.Jitter,
+                    Throttle = options.Throttle,
+                    LdapFilter = options.LdapFilter,
+                    PortScanTimeout = options.PortCheckTimeout,
+                    ResolvedCollectionMethods = resolved,
+                    Threads = options.Threads,
+                    LoopDuration = options.LoopDuration,
+                    LoopInterval = options.LoopInterval,
+                    ZipPassword = options.ZipPassword,
+                    IsFaulted = false,
+                    IsProxyEnabled = proxyConfig != null,
+                    LocalAdminUsername = options.LocalAdminUsername,
+                    LocalAdminPassword = options.LocalAdminPassword
+                };
+
+                var cancellationTokenSource = new CancellationTokenSource();
+                context.CancellationTokenSource = cancellationTokenSource;
+
+                // Create new chain links
+                Links<IContext> links = new SharpLinks();
+
+                // Run our chain
+                context = links.Initialize(context, ldapOptions);
+                if (context.Flags.IsFaulted)
+                    return;
+                context = await links.TestConnection(context);
+                if (context.Flags.IsFaulted)
+                    return;
+                context = links.SetSessionUserName(options.OverrideUserName, context);
+                context = links.InitCommonLib(context);
+                context = await links.GetDomainsForEnumeration(context);
+                if (context.Flags.IsFaulted)
+                    return;
+                context = links.StartBaseCollectionTask(context);
+                context = await links.AwaitBaseRunCompletion(context);
+                context = links.StartLoopTimer(context);
+                context = links.StartLoop(context);
+                context = await links.AwaitLoopCompletion(context);
+                context = links.SaveCacheFile(context);
+                links.Finish(context);
+            }
+            finally
+            {
+                ldapRelay?.Dispose();
+                ldapsRelay?.Dispose();
+            }
         }
 
         // Accessor function for the PS1 to work, do not change or remove

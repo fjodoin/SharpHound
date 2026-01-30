@@ -34,6 +34,7 @@ namespace Sharphound
         }
 
         public bool IsFaulted { get; set; }
+        public bool IsProxyEnabled { get; set; }
 
         public CollectionMethod ResolvedCollectionMethods { get; set; }
         public string LdapFilter { get; set; }

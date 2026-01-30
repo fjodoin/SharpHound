@@ -63,6 +63,8 @@ namespace Sharphound.Client
 
         public string LocalAdminPassword { get; set; }
 
+        bool IsProxyEnabled { get; set; }
+
         CollectionMethod ResolvedCollectionMethods { get; set; }
 
         /// <summary>
